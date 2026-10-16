@@ -7,24 +7,29 @@ describe progress only; they never override that field or apply exceptions.
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from io import BytesIO
 import json
 from pathlib import Path
 import re
 import unicodedata
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
+from collections.abc import Mapping
+import tomllib
+from urllib.parse import quote
+
+import requests
+from google.auth.exceptions import GoogleAuthError
+from google.auth.transport.requests import AuthorizedSession
+from google.oauth2.service_account import Credentials as GoogleCredentials
 from zipfile import BadZipFile
 
 from openpyxl import load_workbook
 from openpyxl.utils.exceptions import InvalidFileException
 
-DEFAULT_SHEET_ID = "1fp9zse-tPuMC2zBfiUiV9WW5RnR8uA38lqDcDSgSoo8"
 DEFAULT_WORKSHEET = "Fall 26 membership"
 REQUIRED_MEETINGS = 3
-MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024
+SHEETS_READONLY_SCOPES = ("https://www.googleapis.com/auth/spreadsheets.readonly",)
 EVENT_HEADERS = {
     "volunteering": "Volunteered?",
     "social": "Social Event Attended?",
@@ -190,25 +195,86 @@ class MembershipBook:
         return matches[0]
 
 
-def download_workbook(sheet_id: str = DEFAULT_SHEET_ID) -> bytes:
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", sheet_id):
-        raise MembershipError("The configured Google Sheet ID is invalid.")
-    url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=xlsx"
-    request = Request(url, headers={"User-Agent": "MembershipChecker/1.0"})
+@dataclass(frozen=True)
+class ConnectionSettings:
+    spreadsheet_id: str
+    worksheet: str
+    service_account_info: dict = field(repr=False)
+
+
+def parse_connection_settings(section: Mapping) -> ConnectionSettings:
+    """Parse the documented [google_sheets] section without echoing secrets."""
+    if not isinstance(section, Mapping):
+        raise MembershipError("The google_sheets secrets section is missing or invalid.")
+    sheet_id = section.get("spreadsheet_id", "")
+    if not isinstance(sheet_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", sheet_id):
+        raise MembershipError("Set spreadsheet_id to the sheet ID in the google_sheets secrets section.")
+    worksheet = section.get("worksheet", DEFAULT_WORKSHEET)
+    if not isinstance(worksheet, str) or not worksheet.strip():
+        raise MembershipError("Set worksheet to the membership tab name in the google_sheets secrets section.")
+    raw = section.get("service_account_json")
+    if not isinstance(raw, str):
+        raise MembershipError("Set service_account_json to the entire downloaded JSON key inside triple single quotes.")
     try:
-        with urlopen(request, timeout=20) as response:
-            data = response.read(MAX_DOWNLOAD_BYTES + 1)
-    except HTTPError as exc:
-        if exc.code in {401, 403, 404}:
-            raise MembershipError("The membership sheet is unavailable. The secretary should check its public viewing and download permissions.") from exc
-        raise MembershipError("Google Sheets could not provide the membership data. Please try again shortly.") from exc
-    except (URLError, TimeoutError, OSError) as exc:
-        raise MembershipError("The membership sheet could not be reached. Please try again shortly.") from exc
-    if len(data) > MAX_DOWNLOAD_BYTES:
-        raise MembershipError("The membership workbook exceeds the 10 MB download limit.")
-    if not data.startswith(b"PK"):
-        raise MembershipError("Google Sheets did not return an Excel file. The secretary should check its public viewing and download permissions.")
-    return data
+        info = json.loads(raw)
+    except (ValueError, TypeError):
+        raise MembershipError("service_account_json is not valid JSON. Copy the entire downloaded key, including both braces, between the triple single quotes.") from None
+    if (not isinstance(info, dict) or info.get("type") != "service_account"
+            or not all(isinstance(info.get(key), str) and info[key].strip()
+                       for key in ("client_email", "private_key", "token_uri"))):
+        raise MembershipError("service_account_json must contain the complete downloaded service-account key.")
+    if info["token_uri"] not in {"https://oauth2.googleapis.com/token", "https://accounts.google.com/o/oauth2/token"}:
+        raise MembershipError("The key's authentication endpoint is not a supported Google endpoint.")
+    return ConnectionSettings(sheet_id, worksheet, info)
+
+
+def read_secrets_file(path: str | Path) -> ConnectionSettings:
+    try:
+        with Path(path).open("rb") as source:
+            config = tomllib.load(source)
+    except (OSError, ValueError):
+        # TOML exceptions can include credential text; never expose their text.
+        raise MembershipError("The local secrets file could not be read. Check .streamlit/secrets.toml and its TOML formatting.") from None
+    return parse_connection_settings(config.get("google_sheets"))
+
+
+def read_private_sheet(sheet_id: str, worksheet: str, service_account_info: dict | None) -> MembershipBook:
+    """Read a private Google Sheet with a scoped service account. No public fallback."""
+    if not isinstance(sheet_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", sheet_id):
+        raise MembershipError("The configured Google Sheet ID is invalid or missing.")
+    if not service_account_info:
+        raise MembershipError("Private-sheet credentials are missing. Configure the google_sheets secrets section.")
+    try:
+        credentials = GoogleCredentials.from_service_account_info(
+            service_account_info, scopes=SHEETS_READONLY_SCOPES)
+    except (ValueError, TypeError, KeyError, GoogleAuthError):
+        raise MembershipError("The service-account key could not be loaded. Check that service_account_json contains the full, valid downloaded key.") from None
+    # Quoting the whole tab name prevents special characters from changing the range.
+    sheet_range = "'" + worksheet.replace("'", "''") + "'"
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{quote(sheet_range, safe='')}"
+    try:
+        with AuthorizedSession(credentials, refresh_timeout=20) as session:
+            response = session.get(url, params={"majorDimension": "ROWS",
+                "valueRenderOption": "UNFORMATTED_VALUE"}, timeout=20)
+            if response.status_code == 400:
+                raise MembershipError("Google could not read the configured worksheet. Check the worksheet name in your secrets.")
+            if response.status_code in {401, 403, 404}:
+                raise MembershipError("The private membership sheet could not be accessed. Check the sheet ID, Viewer sharing with the service account, and that Google Sheets API is enabled.")
+            if response.status_code != 200:
+                raise MembershipError("Google Sheets is temporarily unavailable. Please try again shortly.")
+            payload = response.json()
+    except GoogleAuthError:
+        raise MembershipError("Google authentication failed. Check that the service-account key is active and copied correctly in your secrets.") from None
+    except requests.RequestException:
+        raise MembershipError("The private membership sheet could not be reached. Please try again shortly.") from None
+    except (ValueError, TypeError):
+        raise MembershipError("Google Sheets returned an unreadable response. Please try again shortly.") from None
+    if not isinstance(payload, dict) or not isinstance(payload.get("values", []), list):
+        raise MembershipError("Google Sheets returned an unexpected data format.")
+    values = payload.get("values", [])
+    if any(not isinstance(row, list) for row in values):
+        raise MembershipError("Google Sheets returned an unexpected row format.")
+    return read_rows(values, worksheet)
 
 
 def read_workbook(data: bytes, worksheet: str = DEFAULT_WORKSHEET) -> MembershipBook:
@@ -220,75 +286,81 @@ def read_workbook(data: bytes, worksheet: str = DEFAULT_WORKSHEET) -> Membership
         if worksheet not in workbook.sheetnames:
             raise MembershipError(f'The configured worksheet "{worksheet}" is missing. Ask the secretary to check the app settings.')
         sheet = workbook[worksheet]
-        rows = sheet.iter_rows(values_only=True)
-        headers = next(rows, ())
-        columns = {}
-        for index, value in enumerate(headers):
-            if value is None or not str(value).strip():
-                continue
-            key = header_key(value)
-            if key in columns:
-                raise MembershipError("The membership sheet has duplicate column headers. Ask the secretary to correct them.")
-            columns[key] = index
-
-        def column(label: str) -> int:
-            key = header_key(label)
-            if key not in columns:
-                raise MembershipError(f'The membership sheet is missing the "{label}" column.')
-            return columns[key]
-
-        name_col = column("Name")
-        active_col = column("Active Member?")
-        dues_col = column("Dues Paid?")
-        total_col = column("Total Meetings Attended (3)")
-        meeting_cols = [index for index in range(dues_col + 1, total_col)
-                        if headers[index] is not None and str(headers[index]).strip()]
-        if not meeting_cols:
-            raise MembershipError("No general-meeting columns were found between dues and the meeting total.")
-        event_cols = {key: column(label) for key, label in EVENT_HEADERS.items()}
-        reserved = {name_col, active_col, dues_col, total_col, *event_cols.values()}
-        if reserved.intersection(meeting_cols):
-            raise MembershipError("The membership column layout changed. Ask the secretary to review the app configuration.")
-        members = []
-        for row_number, row in enumerate(rows, start=2):
-            name = row[name_col]
-            if not isinstance(name, str) or not name.strip():
-                continue
-            if normalize(name).rstrip(":") in {"total", "totals", "grand total", "grand totals"}:
-                continue
-            issues = []
-
-            def flag(index: int, *, blank_is_false: bool = True) -> bool | None:
-                value = parse_flag(row[index], blank_is_false=blank_is_false)
-                if value is None:
-                    issues.append(f'Unrecognized or missing value in "{str(headers[index]).replace(chr(10), " ")}".')
-                return value
-
-            official_active = flag(active_col, blank_is_false=False)
-            dues_paid = parse_dues(row[dues_col])
-            if dues_paid is None:
-                issues.append('Unrecognized or missing value in "Dues Paid?".')
-            meetings = tuple(Activity(str(headers[index]).strip(), flag(index)) for index in meeting_cols)
-            events = {key: Activity(EVENT_LABELS[key], flag(index)) for key, index in event_cols.items()}
-            members.append(Member(name.strip(), row_number, official_active, dues_paid,
-                                  str(row[dues_col] or "Not recorded"), meetings, events, tuple(issues)))
-        if not members:
-            raise MembershipError("The membership sheet does not contain any named member records.")
-        return MembershipBook(tuple(members), worksheet, datetime.now(timezone.utc))
+        return read_rows(sheet.iter_rows(values_only=True), worksheet)
     finally:
         workbook.close()
 
 
-def load_membership(*, file: str | None = None, sheet_id: str = DEFAULT_SHEET_ID,
-                    worksheet: str = DEFAULT_WORKSHEET) -> MembershipBook:
+def read_rows(rows, worksheet: str = DEFAULT_WORKSHEET) -> MembershipBook:
+    """Interpret the same header/row layout from Excel or authenticated Sheets API."""
+    rows = iter(rows)
+    headers = next(rows, ())
+    columns = {}
+    for index, value in enumerate(headers):
+        if value is None or not str(value).strip():
+            continue
+        key = header_key(value)
+        if key in columns:
+            raise MembershipError("The membership sheet has duplicate column headers. Ask the secretary to correct them.")
+        columns[key] = index
+
+    def column(label: str) -> int:
+        key = header_key(label)
+        if key not in columns:
+            raise MembershipError(f'The membership sheet is missing the "{label}" column.')
+        return columns[key]
+
+    name_col = column("Name")
+    active_col = column("Active Member?")
+    dues_col = column("Dues Paid?")
+    total_col = column("Total Meetings Attended (3)")
+    meeting_cols = [index for index in range(dues_col + 1, total_col)
+                    if headers[index] is not None and str(headers[index]).strip()]
+    if not meeting_cols:
+        raise MembershipError("No general-meeting columns were found between dues and the meeting total.")
+    event_cols = {key: column(label) for key, label in EVENT_HEADERS.items()}
+    reserved = {name_col, active_col, dues_col, total_col, *event_cols.values()}
+    if reserved.intersection(meeting_cols):
+        raise MembershipError("The membership column layout changed. Ask the secretary to review the app configuration.")
+    members = []
+    for row_number, raw_row in enumerate(rows, start=2):
+        row = tuple(raw_row) + (None,) * max(0, len(headers) - len(raw_row))
+        name = row[name_col]
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if normalize(name).rstrip(":") in {"total", "totals", "grand total", "grand totals"}:
+            continue
+        issues = []
+
+        def flag(index: int, *, blank_is_false: bool = True) -> bool | None:
+            value = parse_flag(row[index], blank_is_false=blank_is_false)
+            if value is None:
+                issues.append(f'Unrecognized or missing value in "{str(headers[index]).replace(chr(10), " ")}".')
+            return value
+
+        official_active = flag(active_col, blank_is_false=False)
+        dues_paid = parse_dues(row[dues_col])
+        if dues_paid is None:
+            issues.append('Unrecognized or missing value in "Dues Paid?".')
+        meetings = tuple(Activity(str(headers[index]).strip(), flag(index)) for index in meeting_cols)
+        events = {key: Activity(EVENT_LABELS[key], flag(index)) for key, index in event_cols.items()}
+        members.append(Member(name.strip(), row_number, official_active, dues_paid,
+                              str(row[dues_col] or "Not recorded"), meetings, events, tuple(issues)))
+    if not members:
+        raise MembershipError("The membership sheet does not contain any named member records.")
+    return MembershipBook(tuple(members), worksheet, datetime.now(timezone.utc))
+
+
+def load_membership(*, file: str | None = None, sheet_id: str = "",
+                    worksheet: str = DEFAULT_WORKSHEET,
+                    service_account_info: dict | None = None) -> MembershipBook:
     if file:
         try:
             data = Path(file).read_bytes()
-        except OSError as exc:
-            raise MembershipError("The local membership workbook could not be opened.") from exc
-    else:
-        data = download_workbook(sheet_id)
-    return read_workbook(data, worksheet)
+        except OSError:
+            raise MembershipError("The local membership workbook could not be opened.") from None
+        return read_workbook(data, worksheet)
+    return read_private_sheet(sheet_id, worksheet, service_account_info)
 
 
 def state_text(state: bool | None, yes: str, no: str) -> str:
@@ -299,13 +371,22 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--name", help="Member's full name; prompts if omitted")
     parser.add_argument("--file", help="Optional local Excel workbook instead of the live Google Sheet")
-    parser.add_argument("--sheet-id", default=DEFAULT_SHEET_ID)
-    parser.add_argument("--worksheet", default=DEFAULT_WORKSHEET)
+    parser.add_argument("--sheet-id", help="Optional override for the ID in your secrets file")
+    parser.add_argument("--secrets-file", default=str(Path(__file__).resolve().parent / ".streamlit" / "secrets.toml"),
+                        help="Private connection settings; defaults to .streamlit/secrets.toml beside this script")
+    parser.add_argument("--worksheet", help="Optional worksheet name override")
     parser.add_argument("--json", action="store_true", help="Output a JSON report")
     args = parser.parse_args()
     try:
         name = args.name if args.name is not None else input("Full name: ")
-        member = load_membership(file=args.file, sheet_id=args.sheet_id, worksheet=args.worksheet).find(name)
+        if args.file:
+            book = load_membership(file=args.file, worksheet=args.worksheet or DEFAULT_WORKSHEET)
+        else:
+            settings = read_secrets_file(args.secrets_file)
+            book = load_membership(sheet_id=args.sheet_id or settings.spreadsheet_id,
+                                   worksheet=args.worksheet or settings.worksheet,
+                                   service_account_info=settings.service_account_info)
+        member = book.find(name)
     except (MembershipError, EOFError) as exc:
         if args.json:
             print(json.dumps({"error": str(exc)}))

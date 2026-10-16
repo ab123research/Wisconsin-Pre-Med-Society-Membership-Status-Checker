@@ -11,12 +11,11 @@ import streamlit as st
 from branding import brand_css, hero_html, form_heading_html, footer_html
 
 from membership import (
-    DEFAULT_SHEET_ID, DEFAULT_WORKSHEET, REQUIRED_MEETINGS,
-    MembershipError, Member, load_membership, state_text,
+    DEFAULT_WORKSHEET, REQUIRED_MEETINGS, ConnectionSettings,
+    MembershipError, Member, load_membership, state_text, parse_connection_settings,
 )
 
 TERM = os.environ.get("MEMBERSHIP_TERM", "Fall 2026")
-SHEET_ID = os.environ.get("GOOGLE_SHEET_ID", DEFAULT_SHEET_ID)
 WORKSHEET = os.environ.get("WORKSHEET_NAME", DEFAULT_WORKSHEET)
 LOCAL_FILE = os.environ.get("MEMBERSHIP_FILE") or None
 
@@ -24,9 +23,23 @@ CSS = brand_css()
 
 
 @st.cache_data(ttl=60, max_entries=4, show_spinner=False)
-def get_book(sheet_id: str, worksheet: str, local_file: str | None):
-    # The public sheet is fetched server-side; it is never sent as a full table.
-    return load_membership(sheet_id=sheet_id, worksheet=worksheet, file=local_file)
+def get_book(settings: ConnectionSettings | None, local_file: str | None):
+    # Credentials and the full roster stay on the server.
+    if local_file:
+        return load_membership(file=local_file, worksheet=WORKSHEET)
+    if settings is None:
+        raise MembershipError("Private-sheet settings are missing.")
+    return load_membership(sheet_id=settings.spreadsheet_id, worksheet=settings.worksheet,
+                           service_account_info=settings.service_account_info)
+
+
+def private_connection_settings() -> ConnectionSettings:
+    try:
+        section = dict(st.secrets["google_sheets"])
+    except Exception:
+        # Streamlit/TOML parsing errors can include secret text; redact at this boundary.
+        raise MembershipError("Private-sheet settings could not be read. Check the google_sheets section in .streamlit/secrets.toml locally, or in the app's Streamlit Secrets settings when deployed.") from None
+    return parse_connection_settings(section)
 
 
 def marker(state: bool | None) -> str:
@@ -146,7 +159,8 @@ def show_lookup() -> None:
         get_book.clear()
     try:
         with st.spinner("Checking the membership sheet…"):
-            book = get_book(SHEET_ID, WORKSHEET, LOCAL_FILE)
+            settings = None if LOCAL_FILE else private_connection_settings()
+            book = get_book(settings, LOCAL_FILE)
             member = book.find(query)
     except MembershipError as exc:
         st.error(str(exc))
