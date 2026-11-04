@@ -87,6 +87,7 @@ def parse_flag(value: object, *, blank_is_false: bool = True) -> bool | None:
 
 
 def parse_dues(value: object) -> bool | None:
+    """Read fall payment; Semester currently means fall only in this sheet."""
     if isinstance(value, str):
         text = normalize(value)
         if text in {"year", "semester", "paid", "fall", "fall 2026"}:
@@ -118,6 +119,18 @@ class Member:
     meetings: tuple[Activity, ...]
     events: dict[str, Activity]
     issues: tuple[str, ...]
+
+    @property
+    def fall_dues_paid(self) -> bool | None:
+        """The existing dues flag represents fall while the template is finalized."""
+        return self.dues_paid
+
+    @property
+    def spring_dues_paid(self) -> bool | None:
+        """Only a Year payment confirms spring coverage in the current sheet."""
+        if self.dues_paid is None:
+            return None
+        return self.dues_paid is True and normalize(self.dues_record) == "year"
 
     @property
     def meetings_attended(self) -> int:
@@ -171,6 +184,8 @@ class Member:
 
     def report(self) -> dict:
         return {**asdict(self), "meetings_attended": self.meetings_attended,
+                "fall_dues_paid": self.fall_dues_paid,
+                "spring_dues_paid": self.spring_dues_paid,
                 "meetings_total": len(self.meetings),
                 "required_meetings": REQUIRED_MEETINGS,
                 "purple_met": self.purple_met, "pink_met": self.pink_met,
@@ -398,7 +413,8 @@ def main() -> int:
         return 0
     print(f"\n{member.name}")
     print("Official membership status: " + state_text(member.official_active, "Active", "Inactive"))
-    print("Semester dues: " + state_text(member.dues_paid, "Paid", "Not paid"))
+    print("Fall dues: " + state_text(member.fall_dues_paid, "Paid", "Not paid"))
+    print("Spring dues: " + state_text(member.spring_dues_paid, "Paid", "Not paid"))
     print(f"General meetings: {member.meetings_attended} / {len(member.meetings)} (at least {REQUIRED_MEETINGS} required)")
     for meeting in member.meetings:
         print(f"  {meeting.label}: {state_text(meeting.attended, 'Attended', 'Not Attended')}")
@@ -416,3 +432,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

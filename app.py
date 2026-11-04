@@ -18,6 +18,8 @@ from membership import (
 TERM = os.environ.get("MEMBERSHIP_TERM", "Fall 2026")
 WORKSHEET = os.environ.get("WORKSHEET_NAME", DEFAULT_WORKSHEET)
 LOCAL_FILE = os.environ.get("MEMBERSHIP_FILE") or None
+# Contact setting; move to the spreadsheet after its final layout is agreed.
+SECRETARY_EMAIL = "smorrow3@wisc.edu"
 
 CSS = brand_css()
 
@@ -58,8 +60,13 @@ def table_row(state: bool | None, label: str, attendance: str, *,
 
 def requirements_html(member: Member) -> str:
     attendance = lambda flag: state_text(flag, "Attended", "Not Attended")
-    rows = [table_row(member.dues_paid, "Semester dues", state_text(member.dues_paid, "Paid", "Not paid"),
-                      group="dues", note="Dues payment recorded for this semester.")]
+    rows = [table_row(member.fall_dues_paid, "Dues Paid",
+                      state_text(member.fall_dues_paid, "Paid for fall", "Fall not paid"),
+                      group="dues", note="Fall payment counts toward current membership requirements.")]
+    rows.append(table_row(member.fall_dues_paid, "Fall semester",
+                          state_text(member.fall_dues_paid, "Paid", "Not paid")))
+    rows.append(table_row(member.spring_dues_paid, "Spring semester",
+                          state_text(member.spring_dues_paid, "Paid", "Not paid")))
     rows.append(table_row(member.meeting_requirement, "General meetings · Blue",
                           f"{member.meetings_attended} / {len(member.meetings)}",
                           group="blue", note=f"Attend at least {REQUIRED_MEETINGS} general meetings."))
@@ -138,6 +145,8 @@ def main() -> None:
     try:
         show_lookup()
     finally:
+        st.markdown("Any questions or concerns? Contact the secretary at "
+                    f"[{SECRETARY_EMAIL}](mailto:{SECRETARY_EMAIL}).")
         st.html(footer_html(TERM))
 
 
@@ -174,3 +183,4 @@ def show_lookup() -> None:
 
 if __name__ == "__main__":
     main()
+
